@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
     # --- 2. Load Alignment (PENTING: Ganti ke 'id' untuk Indonesia) ---
     print("2. Loading Alignment (Bahasa Indonesia)...")
     # Menggunakan 'id' agar timestamp lebih akurat untuk percakapan indo
-    model_a, metadata = whisperx.load_align_model(language_code="id", device=device)
+    model_a, metadata = whisperx.load_align_model(language_code="en", device=device)
     
     # --- 3. Load Diarization ---
     print("3. Loading Diarization (Pyannote)...")
