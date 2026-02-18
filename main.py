@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
     diarize_model = None
     if HF_TOKEN:
         try:
-            diarize_model = DiarizationPipeline(use_auth_token=HF_TOKEN, device=device)
+            diarize_model = DiarizationPipeline(token=HF_TOKEN, device=device)
             print("✅ Diarization Loaded!")
         except Exception as e:
             print(f"⚠️ Gagal load Diarization: {e}")
