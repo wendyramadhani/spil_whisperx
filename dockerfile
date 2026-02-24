@@ -1,7 +1,7 @@
 # 1. Gunakan Base Image resmi NVIDIA (Sudah ada CUDA & Python)
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
-# 2. Set Environment Variables (Agar Python lancar)
+# 2. Set Environment Variables 
 ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
 
@@ -35,7 +35,6 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     python-multipart
 
-# 7. Copy Semua Codingan Anda ke dalam Docker
 COPY . .
 
 # 8. Buka Port 8000

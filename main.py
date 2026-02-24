@@ -4,56 +4,87 @@ import torch
 import whisperx
 import uvicorn
 import asyncio
+import random
+import uuid
+import gc
+import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from contextlib import asynccontextmanager
 from whisperx.diarize import DiarizationPipeline
 from dotenv import load_dotenv
 
+# --- 1. KUNCI KONSISTENSI AI (Mencegah Halusinasi Acak) ---
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+np.random.seed(42)
+random.seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# --- 2. LOAD ENVIRONMENT VARIABLES ---
 load_dotenv()
-
-# --- KONFIGURASI SERVER ---
-# Masukkan Token Hugging Face
 HF_TOKEN = os.getenv("HF_TOKEN")
+WHISPER_LANG = os.getenv("WHISPER_LANG", "id")
+BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", 16))
+MIN_SPEAKERS = int(os.getenv("WHISPER_MIN_SPEAKERS", 2))
+MAX_SPEAKERS = int(os.getenv("WHISPER_MAX_SPEAKERS", 2))
+TEMPERATURE = float(os.getenv("WHISPER_TEMPERATURE", 0.0))
+INITIAL_PROMPT = os.getenv("WHISPER_PROMPT", "")
 
-# Setup Device
+# --- 3. SETUP DEVICE & PARAMETER GPU ---
 has_gpu = torch.cuda.is_available()
 device = "cuda" if has_gpu else "cpu"
 
 if has_gpu:
     compute_type = "float16" # A100 wajib float16 biar ngebut
-    batch_size = 16 
     model_name = "large-v2"  # Model terbaik
     print(f"🚀 MODE SERVER: GPU {torch.cuda.get_device_name(0)} Aktif!")
 else:
-    # Fallback kalau GPU tidak terdeteksi (Jaga-jaga)
     compute_type = "int8"
-    batch_size = 1
     model_name = "tiny" 
     print("⚠️ WARNING: Server jalan di CPU. Cek driver NVIDIA anda!")
 
+# Tampilkan Konfigurasi Aktif
+print("\n=== KONFIGURASI SERVER AKTIF ===")
+print(f"Bahasa      : {WHISPER_LANG}")
+print(f"Batch Size  : {BATCH_SIZE}")
+print(f"Speakers    : {MIN_SPEAKERS} sampai {MAX_SPEAKERS}")
+print(f"Temperature : {TEMPERATURE}")
+if INITIAL_PROMPT:
+    print(f"Prompt Aktif: {INITIAL_PROMPT[:50]}...")
+print("================================\n")
+
 # Global Variables
 ml_models = {}
-
-# KUNCI PENGAMAN GPU (Agar tidak crash kalau banyak request barengan)
 gpu_lock = asyncio.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- 1. Load Whisper ---
+    # --- A. Menyiapkan Opsi Anti-Halusinasi ---
+    asr_options = {"temperatures": [TEMPERATURE]}
+    if INITIAL_PROMPT:
+        asr_options["initial_prompt"] = INITIAL_PROMPT
+
+    # --- B. Load Model Whisper ---
     print(f"1. Loading Whisper ({model_name})...")
-    model = whisperx.load_model(model_name, device, compute_type=compute_type)
+    model = whisperx.load_model(
+        model_name, 
+        device, 
+        compute_type=compute_type, 
+        asr_options=asr_options
+    )
     
-    # --- 2. Load Alignment (PENTING: Ganti ke 'id' untuk Indonesia) ---
-    print("2. Loading Alignment (Bahasa Indonesia)...")
-    # Menggunakan 'id' agar timestamp lebih akurat untuk percakapan indo
-    model_a, metadata = whisperx.load_align_model(language_code="en", device=device)
+    # --- C. Load Model Alignment ---
+    print(f"2. Loading Alignment ({WHISPER_LANG})...")
+    model_a, metadata = whisperx.load_align_model(language_code=WHISPER_LANG, device=device)
     
-    # --- 3. Load Diarization ---
+    # --- D. Load Diarization ---
     print("3. Loading Diarization (Pyannote)...")
     diarize_model = None
     if HF_TOKEN:
         try:
-            diarize_model = DiarizationPipeline(token=HF_TOKEN, device=device)
+            diarize_model = DiarizationPipeline(device=device)
             print("✅ Diarization Loaded!")
         except Exception as e:
             print(f"⚠️ Gagal load Diarization: {e}")
@@ -66,11 +97,12 @@ async def lifespan(app: FastAPI):
     ml_models["metadata"] = metadata
     ml_models["diarize"] = diarize_model
     
-    print("✅ SERVER SIAP MENERIMA REQUEST!")
+    print("\n✅ SERVER SIAP MENERIMA REQUEST!")
     yield
     
     # Cleanup saat server mati
     ml_models.clear()
+    gc.collect()
     if device == "cuda": 
         torch.cuda.empty_cache()
 
@@ -78,41 +110,53 @@ app = FastAPI(title="WhisperX API Server", lifespan=lifespan)
 
 @app.post("/transcribe/")
 async def transcribe(file: UploadFile = File(...)):
-    # Kunci Pintu: Hanya boleh 1 proses dalam 1 waktu
     if gpu_lock.locked():
         print("⏳ GPU sedang sibuk, request masuk antrean...")
         
-    async with gpu_lock: # <--- Request lain harus nunggu di sini sampai ini selesai
-        temp_filename = f"temp_{file.filename}"
+    async with gpu_lock: 
+        # Menggunakan UUID agar nama file unik (Mencegah file tertimpa jika request barengan)
+        unik_id = uuid.uuid4().hex
+        temp_filename = f"temp_{unik_id}_{file.filename}"
+        audio = None # Inisialisasi awal untuk cleanup
+        
         try:
-            # Ambil model dari memory
-            model = ml_models["transcribe"]
-            model_a = ml_models["align"]
-            metadata = ml_models["metadata"]
-            diarize_model = ml_models.get("diarize")
-
             # Simpan file sementara
             with open(temp_filename, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             
             print(f"🎤 Processing Start: {file.filename}")
             
-            # A. Transcribe
+            # Load Audio
             audio = whisperx.load_audio(temp_filename)
-            result = model.transcribe(audio, batch_size=batch_size)
             
-            # B. Align (Pakai model 'id' yang sudah diload)
-            # Note: Jika audio terdeteksi bukan 'id', idealnya load ulang model align.
-            # Tapi demi kecepatan server, kita paksa pakai model 'id' default.
-            result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
+            # 1. Transcribe
+            result = ml_models["transcribe"].transcribe(
+                audio, 
+                batch_size=BATCH_SIZE, 
+                language=WHISPER_LANG
+            )
             
-            # C. Diarization
-            if diarize_model:
+            # 2. Align
+            result = whisperx.align(
+                result["segments"], 
+                ml_models["align"], 
+                ml_models["metadata"], 
+                audio, 
+                device, 
+                return_char_alignments=False
+            )
+            
+            # 3. Diarization (Pakai Min/Max dari env)
+            if ml_models.get("diarize"):
                 print("   ...Diarization Running...")
-                diarize_segments = diarize_model(audio)
+                diarize_segments = ml_models["diarize"](
+                    audio, 
+                    min_speakers=MIN_SPEAKERS, 
+                    max_speakers=MAX_SPEAKERS
+                )
                 result = whisperx.assign_word_speakers(diarize_segments, result)
             
-            # D. Formatting
+            # 4. Formatting Output
             formatted_output = []
             for segment in result["segments"]:
                 formatted_output.append({
@@ -127,17 +171,25 @@ async def transcribe(file: UploadFile = File(...)):
             raise HTTPException(status_code=500, detail=str(e))
             
         finally:
-            # Bersih-bersih file
+            # --- PEMBERSIHAN EKSTREM ---
+            # 1. Hapus file audio fisik
             if os.path.exists(temp_filename): 
                 os.remove(temp_filename)
-            
-            # Bersih-bersih VRAM GPU (WAJIB DI SERVER)
+                
+            # 2. Hapus variabel besar dari memori Python
+            try:
+                del audio
+                del result
+            except:
+                pass
+                
+            # 3. Kuras sisa cache GPU dan RAM
+            gc.collect()
             if device == "cuda":
                 torch.cuda.empty_cache()
             
-            print(f"✅ Processing Done: {file.filename}")
+            print(f"✅ Processing Done: {file.filename} | Memory Cleared.")
+
 
 if __name__ == "__main__":
-    # Reload=False untuk production
-    # Workers=1 karena WhisperX tidak thread-safe (kita pakai Lock di atas)
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
